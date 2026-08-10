@@ -1,11 +1,22 @@
 import logging
 
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from core.apps import CoreConfig
 from core.services import send_password_expiry_reminders
 
 logger = logging.getLogger(__name__)
+
+
+def async_job_jobstore_heartbeat():
+    """
+    No-op wakeup. A sleeping APScheduler only re-reads its job store when it
+    wakes, so this periodic job bounds the pickup latency of one-off async
+    jobs persisted into the DB-backed store by processes without a live
+    scheduler (the run_as_scheduled_job handoff).
+    """
+    logger.debug("async job store heartbeat")
 
 
 def schedule_tasks(scheduler):
@@ -20,3 +31,16 @@ def schedule_tasks(scheduler):
         replace_existing=True,
     )
     logger.info("Scheduled core password expiry email reminders")
+
+    poll_seconds = int(CoreConfig.async_job_jobstore_poll_seconds)
+    if poll_seconds > 0:
+        scheduler.add_job(
+            async_job_jobstore_heartbeat,
+            trigger=IntervalTrigger(seconds=poll_seconds),
+            id="core_async_job_jobstore_heartbeat",
+            max_instances=1,
+            replace_existing=True,
+        )
+        logger.info(
+            "Scheduled async job store heartbeat every %ss", poll_seconds
+        )
