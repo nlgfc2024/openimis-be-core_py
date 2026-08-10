@@ -1,10 +1,14 @@
 import logging
+from copy import deepcopy
 
+from django.apps import apps as django_apps
+from django.conf import settings
 from django.core.cache import caches
 from django.utils import timezone
 
 from core.models import AsyncJob
 from core.services.utils import output_exception, output_result_success
+from core.utils import get_scheduler_method_ref, set_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -147,3 +151,140 @@ def update_progress(
         )
     except Exception as exc:
         return output_exception("AsyncJob", "update_progress", exc)
+
+
+def execute_async_job(job_uuid):
+    """
+    Shared worker entry point: what actually runs on the scheduler/worker.
+    Only the job uuid crosses the process boundary (the core.tasks precedent
+    for async mutations); the job row is re-loaded here. No-op unless the job
+    is still RECEIVED/QUEUED, which guards against scheduler misfire replays.
+    """
+    job = AsyncJob.objects.filter(id=job_uuid).first()
+    if job is None:
+        logger.warning("AsyncJob %s does not exist, nothing to execute", job_uuid)
+        return
+    reporter = ProgressReporter(job)
+    if not reporter.start():
+        logger.info(
+            "AsyncJob %s is already %s, skipping execution (misfire replay guard)",
+            job.id,
+            job.status,
+        )
+        return
+    if job.user_id:
+        set_current_user(job.user)
+    try:
+        task_fn = get_scheduler_method_ref(job.task)
+        task_fn(reporter=reporter, **(job.params or {}))
+        job.refresh_from_db()
+        if not job.is_terminal:
+            reporter.succeed()
+    except Exception as exc:
+        logger.exception(
+            "AsyncJob %s (%s.%s) failed", job.id, job.module, job.job_type
+        )
+        job.refresh_from_db()
+        if not job.is_terminal:
+            reporter.fail(exc)
+
+
+def _task_path(fn):
+    if callable(fn):
+        return f"{fn.__module__}.{fn.__qualname__}"
+    return fn
+
+
+def _create_job(fn, module, job_type, user, params, client_mutation_id):
+    return AsyncJob.objects.create(
+        module=module,
+        job_type=job_type,
+        task=_task_path(fn),
+        user=user if getattr(user, "id", None) else None,
+        params=params or {},
+        client_mutation_id=client_mutation_id,
+    )
+
+
+def _mark_queued(job):
+    AsyncJob.objects.filter(id=job.id, status=AsyncJob.Status.RECEIVED).update(
+        status=AsyncJob.Status.QUEUED, updated_at=timezone.now()
+    )
+
+
+def _get_live_scheduler():
+    from core.scheduler import scheduler as core_scheduler
+
+    if core_scheduler.running:
+        return core_scheduler
+    try:
+        runner = django_apps.get_app_config("apscheduler_runner")
+        runner_scheduler = getattr(runner, "scheduler", None)
+        if runner_scheduler is not None and runner_scheduler.running:
+            return runner_scheduler
+    except LookupError:
+        pass
+    return None
+
+
+def _persist_to_jobstore(**job_kwargs):
+    """
+    DjangoJobStore handoff for processes without a live scheduler (gunicorn
+    forces SCHEDULER_AUTOSTART off): a throwaway scheduler is opened in paused
+    mode purely to persist the one-off job into the DB-backed job store, then
+    shut down. The dedicated scheduler process (entrypoint.sh scheduler mode
+    -> manage.py runapscheduler) picks it up from the shared store, within the
+    async_job_jobstore_poll_seconds heartbeat interval.
+    """
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    handoff = BackgroundScheduler(deepcopy(settings.SCHEDULER_CONFIG))
+    handoff.start(paused=True)
+    try:
+        handoff.add_job(execute_async_job, **job_kwargs)
+    finally:
+        # DjangoJobStore.shutdown() closes the shared Django DB connection,
+        # which would kill the caller's open transaction — detach the store
+        # (job row already persisted) before shutting the scheduler down.
+        handoff.remove_jobstore("default", shutdown=False)
+        handoff.shutdown(wait=False)
+
+
+def run_as_scheduled_job(
+    fn, module, job_type, user=None, params=None, client_mutation_id=None
+):
+    """
+    Create an AsyncJob for fn and run it on APScheduler, returning the job
+    uuid immediately. fn may be a callable or its dotted path; it is invoked
+    as fn(reporter=ProgressReporter, **params).
+    """
+    job = _create_job(fn, module, job_type, user, params, client_mutation_id)
+    job_kwargs = {
+        "trigger": "date",
+        "args": [str(job.id)],
+        "id": f"async_job_{job.id}",
+        "misfire_grace_time": 86400,
+        "replace_existing": True,
+    }
+    live_scheduler = _get_live_scheduler()
+    if live_scheduler is not None:
+        live_scheduler.add_job(execute_async_job, **job_kwargs)
+    else:
+        _persist_to_jobstore(**job_kwargs)
+    _mark_queued(job)
+    return job.id
+
+
+def run_as_celery_job(
+    fn, module, job_type, user=None, params=None, client_mutation_id=None
+):
+    """
+    Create an AsyncJob for fn and run it on the Celery worker, returning the
+    job uuid immediately. Same contract as run_as_scheduled_job.
+    """
+    job = _create_job(fn, module, job_type, user, params, client_mutation_id)
+    from core.tasks import execute_async_job_task
+
+    execute_async_job_task.delay(str(job.id))
+    _mark_queued(job)
+    return job.id
