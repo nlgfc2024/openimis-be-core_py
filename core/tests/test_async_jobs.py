@@ -2,7 +2,9 @@ from django.test import TestCase
 from django.utils import timezone
 
 from core.models import AsyncJob
-from core.test_helpers import create_test_interactive_user
+from core.services import ProgressReporter, update_progress
+from core.services.asyncJobServices import cache, progress_cache_key
+from core.test_helpers import create_test_interactive_user, create_test_role
 
 
 class AsyncJobModelTest(TestCase):
@@ -76,3 +78,142 @@ class AsyncJobModelTest(TestCase):
         self.assertEqual(job.params, {"district": "101"})
         self.assertEqual(job.metrics["staged"], 3)
         self.assertEqual(job.result["note"], "done")
+
+
+class ProgressReporterTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_test_interactive_user(username="reporter_tester")
+
+    def setUp(self):
+        self.job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            task="msr_etl.jobs.run_ubr_individuals_import",
+            user=self.user,
+        )
+        self.reporter = ProgressReporter(self.job)
+
+    def test_start_transitions_once(self):
+        self.assertTrue(self.reporter.start())
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.RUNNING)
+        self.assertIsNotNone(self.job.started_at)
+        # misfire replay guard: second start is a no-op
+        self.assertFalse(self.reporter.start())
+
+    def test_set_total_and_advance_write_absolute_values(self):
+        self.reporter.set_total(10)
+        self.reporter.advance()
+        self.reporter.advance(k=2, staged=2)
+        self.reporter.advance(staged=1, errors=1)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.total, 10)
+        self.assertEqual(self.job.processed, 4)
+        self.assertEqual(self.job.metrics, {"staged": 3, "errors": 1})
+
+    def test_message(self):
+        self.reporter.message("Processing chunk 3 of 11")
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.message, "Processing chunk 3 of 11")
+
+    def test_succeed(self):
+        self.reporter.succeed(result={"rows": 42})
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.SUCCESS)
+        self.assertEqual(self.job.result, {"rows": 42})
+        self.assertIsNotNone(self.job.finished_at)
+
+    def test_partial(self):
+        self.reporter.partial(error="2 units failed")
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.PARTIAL)
+        self.assertEqual(self.job.error, "2 units failed")
+
+    def test_fail(self):
+        self.reporter.fail(RuntimeError("upstream timeout"))
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.FAILED)
+        self.assertEqual(self.job.error, "upstream timeout")
+
+    def test_updated_at_set_on_update(self):
+        before = self.job.updated_at
+        self.reporter.advance()
+        self.job.refresh_from_db()
+        self.assertGreater(self.job.updated_at, before)
+
+    def test_cache_snapshot_written(self):
+        self.reporter.set_total(5)
+        self.reporter.advance(k=3, synced=3)
+        snapshot = cache.get(progress_cache_key(self.job.id))
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["total"], 5)
+        self.assertEqual(snapshot["processed"], 3)
+        self.assertEqual(snapshot["metrics"], {"synced": 3})
+
+    def test_resumes_counters_from_job_row(self):
+        AsyncJob.objects.filter(id=self.job.id).update(
+            processed=7, metrics={"synced": 7}
+        )
+        self.job.refresh_from_db()
+        reporter = ProgressReporter(self.job)
+        reporter.advance(synced=1)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.processed, 8)
+        self.assertEqual(self.job.metrics, {"synced": 8})
+
+
+class UpdateProgressServiceTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.owner = create_test_interactive_user(username="progress_owner")
+        # non-admin role: the default helper role is IMIS admin, which makes
+        # the user a superuser and would pass the ownership check
+        cls.other = create_test_interactive_user(
+            username="progress_other", roles=[create_test_role().id]
+        )
+
+    def setUp(self):
+        self.job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            task="msr_etl.jobs.run_ubr_individuals_import",
+            user=self.owner,
+        )
+
+    def test_owner_can_report(self):
+        result = update_progress(
+            self.owner, self.job.id, processed=5, total=10,
+            message="half way", metrics={"synced": 5},
+        )
+        self.assertTrue(result["success"], result)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.processed, 5)
+        self.assertEqual(self.job.total, 10)
+        self.assertEqual(self.job.message, "half way")
+        self.assertEqual(self.job.metrics, {"synced": 5})
+
+    def test_metrics_merge_additively(self):
+        update_progress(self.owner, self.job.id, metrics={"synced": 2})
+        update_progress(self.owner, self.job.id, metrics={"synced": 3, "errors": 1})
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.metrics, {"synced": 5, "errors": 1})
+
+    def test_non_owner_denied(self):
+        result = update_progress(self.other, self.job.id, processed=1)
+        self.assertFalse(result["success"])
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.processed, 0)
+
+    def test_terminal_job_not_updated(self):
+        AsyncJob.objects.filter(id=self.job.id).update(
+            status=AsyncJob.Status.SUCCESS
+        )
+        result = update_progress(self.owner, self.job.id, processed=1)
+        self.assertFalse(result["success"])
+
+    def test_missing_job(self):
+        import uuid
+
+        result = update_progress(self.owner, uuid.uuid4(), processed=1)
+        self.assertFalse(result["success"])
