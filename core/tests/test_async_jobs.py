@@ -347,3 +347,72 @@ class DispatchTest(TestCase):
         self.assertEqual(
             job.task, "core.tests.test_async_jobs._passing_worker"
         )
+
+
+class AsyncJobGQLTypeTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from core.schema import AsyncJobGQLType
+
+        cls.gql_type = AsyncJobGQLType
+        cls.owner = create_test_interactive_user(username="gql_owner")
+        cls.plain_role = create_test_role()
+        cls.other = create_test_interactive_user(
+            username="gql_other", roles=[cls.plain_role.id]
+        )
+        cls.viewer = create_test_interactive_user(
+            username="gql_viewer",
+            roles=[
+                create_test_role(
+                    perm_names=["gql_query_async_jobs_perms"],
+                    name="AsyncJobViewer",
+                ).id
+            ],
+        )
+        cls.own_job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            task="msr_etl.jobs.run_ubr_individuals_import",
+            user=cls.owner,
+            client_mutation_id="cm-gql-1",
+        )
+        cls.other_job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_locations_import",
+            task="msr_etl.jobs.run_ubr_locations_import",
+            user=cls.other,
+        )
+
+    def _scoped(self, user):
+        info = mock.Mock()
+        info.context.user = user
+        return self.gql_type.get_queryset(AsyncJob.objects.all(), info)
+
+    def test_anonymous_sees_nothing(self):
+        from django.contrib.auth.models import AnonymousUser
+
+        self.assertEqual(self._scoped(AnonymousUser()).count(), 0)
+
+    def test_user_sees_only_own_jobs(self):
+        scoped = self._scoped(self.other)
+        self.assertEqual(list(scoped), [self.other_job])
+
+    def test_superuser_sees_all(self):
+        # the default test-helper role is IMIS admin -> superuser
+        self.assertEqual(self._scoped(self.owner).count(), 2)
+
+    def test_right_900102_sees_all(self):
+        self.assertFalse(self.viewer.is_superuser)
+        self.assertEqual(self._scoped(self.viewer).count(), 2)
+
+    def test_query_field_registered_with_uuid_scalar(self):
+        from openIMIS.schema import schema as global_schema
+
+        sdl = str(global_schema)
+        self.assertIn("asyncJobs(", sdl)
+        self.assertIn("AsyncJobGQLType", sdl)
+        # parts of the fe-core polling contract: correlation-key filter,
+        # status_In, and the plain uuid scalar alongside the relay id
+        self.assertIn("clientMutationId", sdl)
+        self.assertIn("status_In", sdl)
+        self.assertIn("uuid: UUID", sdl)
