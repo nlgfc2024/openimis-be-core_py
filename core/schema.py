@@ -78,6 +78,7 @@ from core.utils import (  # noqa: 401
     filter_validity
 )
 from core.models import (
+    AsyncJob,
     ModuleConfiguration,
     FieldControl,
     MutationLog,
@@ -709,6 +710,45 @@ class MutationLogGQLType(DjangoObjectType):
         return queryset
 
 
+class AsyncJobGQLType(DjangoObjectType):
+    """
+    A long-running background job and its live progress. Covers both live
+    status and history (the MutationLog precedent): a single job is
+    asyncJobs(clientMutationId: ..., first: 1) or asyncJobs(id: ...).
+    Row-scoped: anonymous sees nothing, a user sees their own jobs,
+    superusers and holders of gql_query_async_jobs_perms see all.
+    """
+
+    # plain uuid alongside the relay global id, so module clients
+    # (e.g. msrEtlSyncUnits(jobUuid)) never need relay-ID decoding
+    uuid = graphene.UUID(source="id")
+
+    class Meta:
+        model = AsyncJob
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "module": ["exact"],
+            "job_type": ["exact"],
+            "status": ["exact", "in"],
+            "client_mutation_id": ["exact"],
+            "created_at": ["exact", "gte", "lte"],
+            "user": ["exact"],
+        }
+        connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        user = info.context.user
+        if user.is_anonymous:
+            return queryset.none()
+        if user.is_superuser or user.has_perms(
+            CoreConfig.gql_query_async_jobs_perms
+        ):
+            return queryset
+        return queryset.filter(user=user)
+
+
 UT_INTERACTIVE = "INTERACTIVE"
 UT_TECHNICAL = "TECHNICAL"
 UT_OFFICER = "OFFICER"
@@ -760,6 +800,9 @@ class Query(graphene.ObjectType):
 
     mutation_logs = OrderedDjangoFilterConnectionField(
         MutationLogGQLType, orderBy=graphene.List(of_type=graphene.String)
+    )
+    async_jobs = OrderedDjangoFilterConnectionField(
+        AsyncJobGQLType, orderBy=graphene.List(of_type=graphene.String)
     )
 
     role = OrderedDjangoFilterConnectionField(

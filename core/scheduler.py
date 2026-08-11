@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -24,6 +25,24 @@ def schedule_tasks(task_scheduler):
     from core.scheduled_tasks import schedule_tasks as schedule_core_tasks
 
     schedule_core_tasks(task_scheduler)
+
+    # Discover other modules' scheduled_tasks.py (same loop as the assembly's
+    # apscheduler_runner), so module periodic jobs also run in the dedicated
+    # scheduler process started by manage.py runapscheduler.
+    for app_ in getattr(settings, "OPENIMIS_APPS", []):
+        if app_ == "core":
+            continue
+        if not importlib.util.find_spec(f"{app_}.scheduled_tasks"):
+            logger.debug("%s has no scheduled_tasks module, skipping", app_)
+            continue
+        try:
+            app_module = __import__(f"{app_}.scheduled_tasks")
+            app_module.scheduled_tasks.schedule_tasks(task_scheduler)
+            logger.debug("%s tasks scheduled", app_)
+        except Exception as exc:
+            logger.warning(
+                "%s: failed to register scheduled tasks: %s", app_, exc
+            )
 
     if settings.SCHEDULER_JOBS:
         for job in settings.SCHEDULER_JOBS:

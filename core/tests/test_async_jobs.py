@@ -1,10 +1,32 @@
+from unittest import mock
+
 from django.test import TestCase
 from django.utils import timezone
 
 from core.models import AsyncJob
-from core.services import ProgressReporter, update_progress
+from core.services import (
+    ProgressReporter,
+    execute_async_job,
+    run_as_celery_job,
+    run_as_scheduled_job,
+    update_progress,
+)
 from core.services.asyncJobServices import cache, progress_cache_key
 from core.test_helpers import create_test_interactive_user, create_test_role
+
+
+def _passing_worker(reporter, **params):
+    reporter.set_total(2)
+    reporter.advance(staged=1)
+    reporter.advance(synced=1)
+
+
+def _partial_worker(reporter, **params):
+    reporter.partial(error="1 unit failed")
+
+
+def _failing_worker(reporter, **params):
+    raise RuntimeError("upstream exploded")
 
 
 class AsyncJobModelTest(TestCase):
@@ -217,3 +239,180 @@ class UpdateProgressServiceTest(TestCase):
 
         result = update_progress(self.owner, uuid.uuid4(), processed=1)
         self.assertFalse(result["success"])
+
+
+class ExecuteAsyncJobTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_test_interactive_user(username="execute_tester")
+
+    def _create_job(self, worker, **kwargs):
+        defaults = dict(
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            task=f"{worker.__module__}.{worker.__qualname__}",
+            user=self.user,
+        )
+        defaults.update(kwargs)
+        return AsyncJob.objects.create(**defaults)
+
+    def test_runs_worker_and_auto_succeeds(self):
+        job = self._create_job(_passing_worker)
+        execute_async_job(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AsyncJob.Status.SUCCESS)
+        self.assertEqual(job.total, 2)
+        self.assertEqual(job.processed, 2)
+        self.assertEqual(job.metrics, {"staged": 1, "synced": 1})
+        self.assertIsNotNone(job.started_at)
+        self.assertIsNotNone(job.finished_at)
+
+    def test_worker_terminal_status_respected(self):
+        job = self._create_job(_partial_worker)
+        execute_async_job(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AsyncJob.Status.PARTIAL)
+        self.assertEqual(job.error, "1 unit failed")
+
+    def test_worker_exception_marks_failed(self):
+        job = self._create_job(_failing_worker)
+        execute_async_job(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AsyncJob.Status.FAILED)
+        self.assertEqual(job.error, "upstream exploded")
+
+    def test_misfire_replay_is_noop(self):
+        job = self._create_job(_passing_worker, status=AsyncJob.Status.SUCCESS)
+        execute_async_job(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.processed, 0)
+
+    def test_missing_job_does_not_raise(self):
+        import uuid
+
+        execute_async_job(uuid.uuid4())
+
+
+class DispatchTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = create_test_interactive_user(username="dispatch_tester")
+
+    def test_run_as_scheduled_job_without_live_scheduler(self):
+        from django_apscheduler.models import DjangoJob
+
+        job_uuid = run_as_scheduled_job(
+            _passing_worker,
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            user=self.user,
+            params={"district": "101"},
+            client_mutation_id="cm-42",
+        )
+        job = AsyncJob.objects.get(id=job_uuid)
+        self.assertEqual(job.status, AsyncJob.Status.QUEUED)
+        self.assertEqual(
+            job.task,
+            "core.tests.test_async_jobs._passing_worker",
+        )
+        self.assertEqual(job.params, {"district": "101"})
+        self.assertEqual(job.client_mutation_id, "cm-42")
+        # the DjangoJobStore handoff persisted the one-off job for the
+        # dedicated scheduler process to pick up
+        self.assertTrue(
+            DjangoJob.objects.filter(id=f"async_job_{job_uuid}").exists()
+        )
+
+    def test_run_as_celery_job_queues_task(self):
+        with mock.patch("core.tasks.execute_async_job_task") as task_mock:
+            job_uuid = run_as_celery_job(
+                _passing_worker,
+                module="msr_etl",
+                job_type="ubr_individuals_import",
+                user=self.user,
+            )
+        task_mock.delay.assert_called_once_with(str(job_uuid))
+        job = AsyncJob.objects.get(id=job_uuid)
+        self.assertEqual(job.status, AsyncJob.Status.QUEUED)
+
+    def test_dotted_path_accepted(self):
+        with mock.patch("core.tasks.execute_async_job_task"):
+            job_uuid = run_as_celery_job(
+                "core.tests.test_async_jobs._passing_worker",
+                module="msr_etl",
+                job_type="ubr_individuals_import",
+                user=self.user,
+            )
+        job = AsyncJob.objects.get(id=job_uuid)
+        self.assertEqual(
+            job.task, "core.tests.test_async_jobs._passing_worker"
+        )
+
+
+class AsyncJobGQLTypeTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from core.schema import AsyncJobGQLType
+
+        cls.gql_type = AsyncJobGQLType
+        cls.owner = create_test_interactive_user(username="gql_owner")
+        cls.plain_role = create_test_role()
+        cls.other = create_test_interactive_user(
+            username="gql_other", roles=[cls.plain_role.id]
+        )
+        cls.viewer = create_test_interactive_user(
+            username="gql_viewer",
+            roles=[
+                create_test_role(
+                    perm_names=["gql_query_async_jobs_perms"],
+                    name="AsyncJobViewer",
+                ).id
+            ],
+        )
+        cls.own_job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_individuals_import",
+            task="msr_etl.jobs.run_ubr_individuals_import",
+            user=cls.owner,
+            client_mutation_id="cm-gql-1",
+        )
+        cls.other_job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_locations_import",
+            task="msr_etl.jobs.run_ubr_locations_import",
+            user=cls.other,
+        )
+
+    def _scoped(self, user):
+        info = mock.Mock()
+        info.context.user = user
+        return self.gql_type.get_queryset(AsyncJob.objects.all(), info)
+
+    def test_anonymous_sees_nothing(self):
+        from django.contrib.auth.models import AnonymousUser
+
+        self.assertEqual(self._scoped(AnonymousUser()).count(), 0)
+
+    def test_user_sees_only_own_jobs(self):
+        scoped = self._scoped(self.other)
+        self.assertEqual(list(scoped), [self.other_job])
+
+    def test_superuser_sees_all(self):
+        # the default test-helper role is IMIS admin -> superuser
+        self.assertEqual(self._scoped(self.owner).count(), 2)
+
+    def test_right_900102_sees_all(self):
+        self.assertFalse(self.viewer.is_superuser)
+        self.assertEqual(self._scoped(self.viewer).count(), 2)
+
+    def test_query_field_registered_with_uuid_scalar(self):
+        from openIMIS.schema import schema as global_schema
+
+        sdl = str(global_schema)
+        self.assertIn("asyncJobs(", sdl)
+        self.assertIn("AsyncJobGQLType", sdl)
+        # parts of the fe-core polling contract: correlation-key filter,
+        # status_In, and the plain uuid scalar alongside the relay id
+        self.assertIn("clientMutationId", sdl)
+        self.assertIn("status_In", sdl)
+        self.assertIn("uuid: UUID", sdl)
