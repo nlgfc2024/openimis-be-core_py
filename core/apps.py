@@ -67,6 +67,7 @@ DEFAULT_CFG = {
     "password_expiry_email_reminder_minute": 10,
     "async_job_jobstore_poll_seconds": 30,
     "gql_query_enable_viewing_masked_data_perms": ["900101"],
+    "gql_query_async_jobs_perms": ["900102"],
     "csrf_protect_login": True,
 }
 
@@ -124,6 +125,7 @@ class CoreConfig(AppConfig):
     password_symbols = settings.PASSWORD_SYMBOLS
 
     gql_query_enable_viewing_masked_data_perms = []
+    gql_query_async_jobs_perms = []
 
     csrf_protect_login = None
 
@@ -252,6 +254,7 @@ class CoreConfig(AppConfig):
         CoreConfig.gql_query_enable_viewing_masked_data_perms = cfg[
             "gql_query_enable_viewing_masked_data_perms"
         ]
+        CoreConfig.gql_query_async_jobs_perms = cfg["gql_query_async_jobs_perms"]
         CoreConfig.csrf_protect_login = cfg["csrf_protect_login"]
 
         CoreConfig.fields_controls_user = cfg["fields_controls_user"]
