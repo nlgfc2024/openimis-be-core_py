@@ -11,7 +11,6 @@ from core.services import (
     run_as_scheduled_job,
     update_progress,
 )
-from core.services.asyncJobServices import cache, progress_cache_key
 from core.test_helpers import create_test_interactive_user, create_test_role
 
 
@@ -50,17 +49,10 @@ class AsyncJobModelTest(TestCase):
         self.assertEqual(job.status, AsyncJob.Status.RECEIVED)
         self.assertEqual(job.processed, 0)
         self.assertIsNone(job.total)
-        self.assertIsNone(job.percent)
         self.assertFalse(job.is_terminal)
         self.assertIsNotNone(job.created_at)
         self.assertIsNone(job.started_at)
         self.assertIsNone(job.finished_at)
-
-    def test_percent_derived_not_stored(self):
-        job = self._create_job(total=22, processed=11)
-        self.assertEqual(job.percent, 50)
-        job.processed = 44
-        self.assertEqual(job.percent, 100)
 
     def test_targeted_update_transition(self):
         job = self._create_job()
@@ -164,15 +156,6 @@ class ProgressReporterTest(TestCase):
         self.job.refresh_from_db()
         self.assertGreater(self.job.updated_at, before)
 
-    def test_cache_snapshot_written(self):
-        self.reporter.set_total(5)
-        self.reporter.advance(k=3, synced=3)
-        snapshot = cache.get(progress_cache_key(self.job.id))
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(snapshot["total"], 5)
-        self.assertEqual(snapshot["processed"], 3)
-        self.assertEqual(snapshot["metrics"], {"synced": 3})
-
     def test_resumes_counters_from_job_row(self):
         AsyncJob.objects.filter(id=self.job.id).update(
             processed=7, metrics={"synced": 7}
@@ -189,8 +172,7 @@ class UpdateProgressServiceTest(TestCase):
     @classmethod
     def setUpTestData(cls):
         cls.owner = create_test_interactive_user(username="progress_owner")
-        # non-admin role: the default helper role is IMIS admin, which makes
-        # the user a superuser and would pass the ownership check
+        # non-admin role: the default helper role implies superuser
         cls.other = create_test_interactive_user(
             username="progress_other", roles=[create_test_role().id]
         )
@@ -317,8 +299,7 @@ class DispatchTest(TestCase):
         )
         self.assertEqual(job.params, {"district": "101"})
         self.assertEqual(job.client_mutation_id, "cm-42")
-        # the DjangoJobStore handoff persisted the one-off job for the
-        # dedicated scheduler process to pick up
+        # handoff persisted the one-off job into the shared store
         self.assertTrue(
             DjangoJob.objects.filter(id=f"async_job_{job_uuid}").exists()
         )
@@ -411,8 +392,7 @@ class AsyncJobGQLTypeTest(TestCase):
         sdl = str(global_schema)
         self.assertIn("asyncJobs(", sdl)
         self.assertIn("AsyncJobGQLType", sdl)
-        # parts of the fe-core polling contract: correlation-key filter,
-        # status_In, and the plain uuid scalar alongside the relay id
+        # fe-core polling contract
         self.assertIn("clientMutationId", sdl)
         self.assertIn("status_In", sdl)
         self.assertIn("uuid: UUID", sdl)

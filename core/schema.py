@@ -712,15 +712,11 @@ class MutationLogGQLType(DjangoObjectType):
 
 class AsyncJobGQLType(DjangoObjectType):
     """
-    A long-running background job and its live progress. Covers both live
-    status and history (the MutationLog precedent): a single job is
-    asyncJobs(clientMutationId: ..., first: 1) or asyncJobs(id: ...).
-    Row-scoped: anonymous sees nothing, a user sees their own jobs,
-    superusers and holders of gql_query_async_jobs_perms see all.
+    A background job and its live progress. Row-scoped: users see their own
+    jobs; superusers and holders of gql_query_async_jobs_perms see all.
     """
 
-    # plain uuid alongside the relay global id, so module clients
-    # (e.g. msrEtlSyncUnits(jobUuid)) never need relay-ID decoding
+    # plain uuid alongside the relay id, so clients skip relay-ID decoding
     uuid = graphene.UUID(source="id")
 
     class Meta:

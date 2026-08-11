@@ -6,14 +6,10 @@ from .user import User
 
 class AsyncJob(UUIDModel, ExtendableModel):
     """
-    Generic handle for any long-running background job, with live progress.
-    Domain-free: no foreign keys to business entities. Module-specific data
-    goes in params/metrics/result; modules may keep child tables keyed to uuid.
-
-    Worker-side transitions must not use save() — a stale instance would
-    override concurrent changes. Use targeted
-    AsyncJob.objects.filter(id=...).update(...) with an explicit updated_at,
-    since auto_now does not fire on update().
+    Generic handle for a long-running background job, with live progress.
+    Domain-free: module data goes in params/metrics/result, never FKs.
+    Transition status via filter(id=...).update(...) with an explicit
+    updated_at, never save().
     """
 
     class Status(models.TextChoices):
@@ -67,12 +63,6 @@ class AsyncJob(UUIDModel, ExtendableModel):
     @property
     def is_terminal(self):
         return self.status in self.TERMINAL_STATUSES
-
-    @property
-    def percent(self):
-        if not self.total:
-            return None
-        return min(100, round(100 * self.processed / self.total))
 
     def __str__(self):
         return f"{self.module}.{self.job_type} [{self.id}] {self.status}"

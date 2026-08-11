@@ -3,7 +3,6 @@ from copy import deepcopy
 
 from django.apps import apps as django_apps
 from django.conf import settings
-from django.core.cache import caches
 from django.utils import timezone
 
 from core.models import AsyncJob
@@ -12,26 +11,12 @@ from core.utils import get_scheduler_method_ref, set_current_user
 
 logger = logging.getLogger(__name__)
 
-cache = caches["default"]
-
-CACHE_KEY_PREFIX = "async_job_progress_"
-CACHE_TTL_SECONDS = 24 * 3600
-
-
-def progress_cache_key(job_id):
-    return f"{CACHE_KEY_PREFIX}{job_id}"
-
 
 class ProgressReporter:
     """
-    Single-writer progress handle injected into async job code, so pipeline
-    logic never touches job persistence directly.
-
-    Exactly one execution owns a job at a time, so counters are kept in memory
-    and written as absolute values — no atomic JSON increments needed. Every
-    write is a targeted AsyncJob.objects.filter(id=...).update(...) plus a
-    cache snapshot; the cache is an optimization only (the default LocMemCache
-    is per-process) and the DB row stays authoritative.
+    Single-writer progress handle injected into async job code. Counters are
+    kept in memory and written as absolute values; the job row is the source
+    of truth.
     """
 
     def __init__(self, job):
@@ -41,15 +26,12 @@ class ProgressReporter:
         self._metrics = dict(job.metrics or {})
 
     def start(self):
-        """RUNNING transition; no-op unless the job is still RECEIVED/QUEUED,
-        which guards against scheduler misfire replays."""
+        """Transition to RUNNING; no-op unless still RECEIVED/QUEUED (misfire guard)."""
         now = timezone.now()
         updated = AsyncJob.objects.filter(
             id=self.job.id,
             status__in=[AsyncJob.Status.RECEIVED, AsyncJob.Status.QUEUED],
         ).update(status=AsyncJob.Status.RUNNING, started_at=now, updated_at=now)
-        if updated:
-            self._snapshot(status=AsyncJob.Status.RUNNING)
         return updated > 0
 
     def set_total(self, total):
@@ -88,30 +70,15 @@ class ProgressReporter:
     def _write(self, **fields):
         fields.setdefault("updated_at", timezone.now())
         AsyncJob.objects.filter(id=self.job.id).update(**fields)
-        self._snapshot(status=fields.get("status"))
-
-    def _snapshot(self, status=None):
-        cache.set(
-            progress_cache_key(self.job.id),
-            {
-                "status": str(status) if status else None,
-                "total": self._total,
-                "processed": self._processed,
-                "metrics": self._metrics,
-            },
-            CACHE_TTL_SECONDS,
-        )
 
 
 def update_progress(
     user, job_uuid, processed=None, total=None, message=None, metrics=None
 ):
     """
-    Authenticated entry point for externally-executed work (e.g. openFN/
-    Lightning workflows) to report progress into a job it does not run
-    in-process. Only the job's initiator or a superuser may report; terminal
-    jobs are never updated. Metric values are increments, merged additively
-    into the stored counters.
+    Entry point for externally-executed work (e.g. openFN workflows) to report
+    into a job. Initiator or superuser only; terminal jobs are never updated;
+    metric values are increments.
     """
     try:
         job = AsyncJob.objects.filter(id=job_uuid).first()
@@ -136,7 +103,6 @@ def update_progress(
                 merged[name] = merged.get(name, 0) + increment
             fields["metrics"] = merged
         AsyncJob.objects.filter(id=job.id).update(**fields)
-        cache.delete(progress_cache_key(job.id))
 
         job.refresh_from_db()
         return output_result_success(
@@ -155,10 +121,8 @@ def update_progress(
 
 def execute_async_job(job_uuid):
     """
-    Shared worker entry point: what actually runs on the scheduler/worker.
-    Only the job uuid crosses the process boundary (the core.tasks precedent
-    for async mutations); the job row is re-loaded here. No-op unless the job
-    is still RECEIVED/QUEUED, which guards against scheduler misfire replays.
+    Worker entry point: re-loads the job by uuid, no-ops unless still
+    RECEIVED/QUEUED, and runs job.task with a ProgressReporter injected.
     """
     job = AsyncJob.objects.filter(id=job_uuid).first()
     if job is None:
@@ -229,12 +193,9 @@ def _get_live_scheduler():
 
 def _persist_to_jobstore(**job_kwargs):
     """
-    DjangoJobStore handoff for processes without a live scheduler (gunicorn
-    forces SCHEDULER_AUTOSTART off): a throwaway scheduler is opened in paused
-    mode purely to persist the one-off job into the DB-backed job store, then
-    shut down. The dedicated scheduler process (entrypoint.sh scheduler mode
-    -> manage.py runapscheduler) picks it up from the shared store, within the
-    async_job_jobstore_poll_seconds heartbeat interval.
+    Persist a one-off job into the DB-backed store via a throwaway paused
+    scheduler; the dedicated scheduler process (manage.py runapscheduler)
+    picks it up.
     """
     from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -243,9 +204,7 @@ def _persist_to_jobstore(**job_kwargs):
     try:
         handoff.add_job(execute_async_job, **job_kwargs)
     finally:
-        # DjangoJobStore.shutdown() closes the shared Django DB connection,
-        # which would kill the caller's open transaction — detach the store
-        # (job row already persisted) before shutting the scheduler down.
+        # DjangoJobStore.shutdown() closes the shared DB connection; detach first
         handoff.remove_jobstore("default", shutdown=False)
         handoff.shutdown(wait=False)
 
@@ -254,9 +213,9 @@ def run_as_scheduled_job(
     fn, module, job_type, user=None, params=None, client_mutation_id=None
 ):
     """
-    Create an AsyncJob for fn and run it on APScheduler, returning the job
-    uuid immediately. fn may be a callable or its dotted path; it is invoked
-    as fn(reporter=ProgressReporter, **params).
+    Create an AsyncJob for fn and run it on APScheduler; returns the job uuid
+    immediately. fn is a callable or dotted path, invoked as
+    fn(reporter=..., **params).
     """
     job = _create_job(fn, module, job_type, user, params, client_mutation_id)
     job_kwargs = {
@@ -278,10 +237,7 @@ def run_as_scheduled_job(
 def run_as_celery_job(
     fn, module, job_type, user=None, params=None, client_mutation_id=None
 ):
-    """
-    Create an AsyncJob for fn and run it on the Celery worker, returning the
-    job uuid immediately. Same contract as run_as_scheduled_job.
-    """
+    """Same contract as run_as_scheduled_job, executed on the Celery worker."""
     job = _create_job(fn, module, job_type, user, params, client_mutation_id)
     from core.tasks import execute_async_job_task
 

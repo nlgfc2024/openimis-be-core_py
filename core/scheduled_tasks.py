@@ -10,12 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 def async_job_jobstore_heartbeat():
-    """
-    No-op wakeup. A sleeping APScheduler only re-reads its job store when it
-    wakes, so this periodic job bounds the pickup latency of one-off async
-    jobs persisted into the DB-backed store by processes without a live
-    scheduler (the run_as_scheduled_job handoff).
-    """
+    """Periodic no-op wakeup so the scheduler re-reads its job store,
+    bounding pickup latency of jobs handed off by web processes."""
     logger.debug("async job store heartbeat")
 
 

@@ -26,9 +26,7 @@ def schedule_tasks(task_scheduler):
 
     schedule_core_tasks(task_scheduler)
 
-    # Discover other modules' scheduled_tasks.py (same loop as the assembly's
-    # apscheduler_runner), so module periodic jobs also run in the dedicated
-    # scheduler process started by manage.py runapscheduler.
+    # register other modules' scheduled_tasks.py (mirrors apscheduler_runner)
     for app_ in getattr(settings, "OPENIMIS_APPS", []):
         if app_ == "core":
             continue

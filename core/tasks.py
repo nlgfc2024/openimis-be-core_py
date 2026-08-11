@@ -59,8 +59,7 @@ def openimis_mutation_async(mutation_id, module, class_name):
 
 @shared_task(name="core_execute_async_job")
 def execute_async_job_task(job_uuid):
-    """Celery wrapper around the shared async-job entry point; only the uuid
-    crosses the queue."""
+    """Celery wrapper for the shared async-job entry point."""
     from core.services.asyncJobServices import execute_async_job
 
     execute_async_job(job_uuid)
