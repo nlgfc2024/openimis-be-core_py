@@ -9,7 +9,8 @@ class AsyncJob(UUIDModel, ExtendableModel):
     Generic handle for a long-running background job, with live progress.
     Domain-free: module data goes in params/metrics/result, never FKs.
     Transition status via filter(id=...).update(...) with an explicit
-    updated_at, never save().
+    updated_at, never save(). params/result are exposed via GraphQL to the
+    job's owner - never put credentials or tokens in them.
     """
 
     class Status(models.TextChoices):

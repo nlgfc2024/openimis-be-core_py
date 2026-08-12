@@ -714,6 +714,9 @@ class AsyncJobGQLType(DjangoObjectType):
     """
     A background job and its live progress. Row-scoped: users see their own
     jobs; superusers and holders of gql_query_async_jobs_perms see all.
+
+    params/result are exposed as-is - modules must not put credentials or
+    tokens in them.
     """
 
     # plain uuid alongside the relay id, so clients skip relay-ID decoding
