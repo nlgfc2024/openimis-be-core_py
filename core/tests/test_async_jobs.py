@@ -150,6 +150,13 @@ class ProgressReporterTest(TestCase):
         self.assertEqual(self.job.status, AsyncJob.Status.FAILED)
         self.assertEqual(self.job.error, "upstream timeout")
 
+    def test_finish_does_not_overwrite_an_already_terminal_job(self):
+        self.reporter.succeed(result={"rows": 1})
+        self.reporter.fail("should not apply")
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.SUCCESS)
+        self.assertIsNone(self.job.error)
+
     def test_updated_at_set_on_update(self):
         before = self.job.updated_at
         self.reporter.advance()

@@ -3,6 +3,7 @@ from copy import deepcopy
 
 from django.apps import apps as django_apps
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from core.models import AsyncJob
@@ -60,12 +61,13 @@ class ProgressReporter:
         self._finish(AsyncJob.Status.FAILED, error=str(error))
 
     def _finish(self, status, result=None, error=None):
-        fields = {"status": status, "finished_at": timezone.now()}
+        """Guarded like start(): never overwrites an already-terminal job."""
+        fields = {"status": status, "finished_at": timezone.now(), "updated_at": timezone.now()}
         if result is not None:
             fields["result"] = result
         if error is not None:
             fields["error"] = error
-        self._write(**fields)
+        AsyncJob.objects.filter(id=self.job.id).exclude(status__in=AsyncJob.TERMINAL_STATUSES).update(**fields)
 
     def _write(self, **fields):
         fields.setdefault("updated_at", timezone.now())
@@ -81,28 +83,30 @@ def update_progress(
     metric values are increments.
     """
     try:
-        job = AsyncJob.objects.filter(id=job_uuid).first()
-        if job is None:
-            raise ValueError(f"AsyncJob {job_uuid} does not exist")
-        is_owner = user is not None and job.user_id == getattr(user, "id", None)
-        if not (is_owner or getattr(user, "is_superuser", False)):
-            raise PermissionError("Only the job initiator or a superuser can report progress")
-        if job.is_terminal:
-            raise ValueError(f"AsyncJob {job_uuid} is already {job.status}")
+        # locked to make the metrics merge below a real read-modify-write
+        with transaction.atomic():
+            job = AsyncJob.objects.select_for_update().filter(id=job_uuid).first()
+            if job is None:
+                raise ValueError(f"AsyncJob {job_uuid} does not exist")
+            is_owner = user is not None and job.user_id == getattr(user, "id", None)
+            if not (is_owner or getattr(user, "is_superuser", False)):
+                raise PermissionError("Only the job initiator or a superuser can report progress")
+            if job.is_terminal:
+                raise ValueError(f"AsyncJob {job_uuid} is already {job.status}")
 
-        fields = {"updated_at": timezone.now()}
-        if processed is not None:
-            fields["processed"] = processed
-        if total is not None:
-            fields["total"] = total
-        if message is not None:
-            fields["message"] = message
-        if metrics:
-            merged = dict(job.metrics or {})
-            for name, increment in metrics.items():
-                merged[name] = merged.get(name, 0) + increment
-            fields["metrics"] = merged
-        AsyncJob.objects.filter(id=job.id).update(**fields)
+            fields = {"updated_at": timezone.now()}
+            if processed is not None:
+                fields["processed"] = processed
+            if total is not None:
+                fields["total"] = total
+            if message is not None:
+                fields["message"] = message
+            if metrics:
+                merged = dict(job.metrics or {})
+                for name, increment in metrics.items():
+                    merged[name] = merged.get(name, 0) + increment
+                fields["metrics"] = merged
+            AsyncJob.objects.filter(id=job.id).update(**fields)
 
         job.refresh_from_db()
         return output_result_success(
