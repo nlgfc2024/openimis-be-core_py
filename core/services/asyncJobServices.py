@@ -13,6 +13,15 @@ from core.utils import get_scheduler_method_ref, set_current_user
 logger = logging.getLogger(__name__)
 
 
+class JobCancelled(Exception):
+    """
+    Raised by ProgressReporter.advance() when the job's row has been marked
+    CANCELLED out-of-band (CancelAsyncJobMutation). Job code is not expected
+    to catch this - it unwinds to execute_async_job, which treats it as a
+    clean stop rather than a failure.
+    """
+
+
 class ProgressReporter:
     """
     Single-writer progress handle injected into async job code. Counters are
@@ -40,6 +49,11 @@ class ProgressReporter:
         self._write(total=total)
 
     def advance(self, k=1, **metrics):
+        """
+        Record progress, then cooperatively check for cancellation. This is
+        the checkpoint job loops hit between units, so a cancelled job stops
+        after the in-flight unit rather than mid-write.
+        """
         self._processed += k
         for name, increment in metrics.items():
             self._metrics[name] = self._metrics.get(name, 0) + increment
@@ -47,6 +61,11 @@ class ProgressReporter:
         if metrics:
             fields["metrics"] = self._metrics
         self._write(**fields)
+        self._check_cancelled()
+
+    def _check_cancelled(self):
+        if AsyncJob.objects.filter(id=self.job.id, status=AsyncJob.Status.CANCELLED).exists():
+            raise JobCancelled(f"AsyncJob {self.job.id} was cancelled")
 
     def message(self, text):
         self._write(message=text)
@@ -148,6 +167,11 @@ def execute_async_job(job_uuid):
         job.refresh_from_db()
         if not job.is_terminal:
             reporter.succeed()
+    except JobCancelled:
+        # status/finished_at are already set by CancelAsyncJobMutation - just stop.
+        logger.info(
+            "AsyncJob %s (%s.%s) stopped: cancelled", job.id, job.module, job.job_type
+        )
     except Exception as exc:
         logger.exception(
             "AsyncJob %s (%s.%s) failed", job.id, job.module, job.job_type

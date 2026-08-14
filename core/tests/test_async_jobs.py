@@ -1,5 +1,6 @@
 from unittest import mock
 
+from django.core.exceptions import PermissionDenied
 from django.test import TestCase
 from django.utils import timezone
 
@@ -11,6 +12,7 @@ from core.services import (
     run_as_scheduled_job,
     update_progress,
 )
+from core.services.asyncJobServices import JobCancelled
 from core.test_helpers import create_test_interactive_user, create_test_role
 
 
@@ -26,6 +28,16 @@ def _partial_worker(reporter, **params):
 
 def _failing_worker(reporter, **params):
     raise RuntimeError("upstream exploded")
+
+
+def _cancelled_mid_run_worker(reporter, **params):
+    reporter.set_total(2)
+    reporter.advance(staged=1)
+    # simulate CancelAsyncJobMutation firing while this unit was in flight
+    AsyncJob.objects.filter(id=reporter.job.id).update(
+        status=AsyncJob.Status.CANCELLED, finished_at=timezone.now()
+    )
+    reporter.advance(staged=1)
 
 
 class AsyncJobModelTest(TestCase):
@@ -163,6 +175,27 @@ class ProgressReporterTest(TestCase):
         self.job.refresh_from_db()
         self.assertGreater(self.job.updated_at, before)
 
+    def test_advance_raises_when_job_cancelled(self):
+        self.reporter.advance()
+        AsyncJob.objects.filter(id=self.job.id).update(
+            status=AsyncJob.Status.CANCELLED
+        )
+        with self.assertRaises(JobCancelled):
+            self.reporter.advance()
+        # the raising call's own progress is still recorded before it checks
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.processed, 2)
+
+    def test_advance_does_not_raise_while_not_cancelled(self):
+        # RUNNING/QUEUED/RECEIVED/SUCCESS/PARTIAL/FAILED must never trip this
+        for status in (
+            AsyncJob.Status.RECEIVED,
+            AsyncJob.Status.QUEUED,
+            AsyncJob.Status.RUNNING,
+        ):
+            AsyncJob.objects.filter(id=self.job.id).update(status=status)
+            self.reporter.advance()
+
     def test_resumes_counters_from_job_row(self):
         AsyncJob.objects.filter(id=self.job.id).update(
             processed=7, metrics={"synced": 7}
@@ -269,6 +302,19 @@ class ExecuteAsyncJobTest(TestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, AsyncJob.Status.FAILED)
         self.assertEqual(job.error, "upstream exploded")
+
+    def test_cancelled_mid_run_stops_without_overwriting_status(self):
+        job = self._create_job(_cancelled_mid_run_worker)
+        execute_async_job(job.id)
+        job.refresh_from_db()
+        self.assertEqual(job.status, AsyncJob.Status.CANCELLED)
+        # the unit that triggered the cancellation check still recorded its
+        # own progress before advance() raised - the loop just never got to
+        # a third unit
+        self.assertEqual(job.processed, 2)
+        self.assertEqual(job.metrics, {"staged": 2})
+        # execute_async_job must not call reporter.fail() on JobCancelled
+        self.assertIsNone(job.error)
 
     def test_misfire_replay_is_noop(self):
         job = self._create_job(_passing_worker, status=AsyncJob.Status.SUCCESS)
@@ -403,3 +449,73 @@ class AsyncJobGQLTypeTest(TestCase):
         self.assertIn("clientMutationId", sdl)
         self.assertIn("status_In", sdl)
         self.assertIn("uuid: UUID", sdl)
+
+
+class CancelAsyncJobMutationTest(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        from core.schema import CancelAsyncJobMutation
+
+        cls.mutation = CancelAsyncJobMutation
+        cls.owner = create_test_interactive_user(username="cancel_owner")
+        # non-admin role: the default helper role implies superuser
+        cls.other = create_test_interactive_user(
+            username="cancel_other", roles=[create_test_role().id]
+        )
+
+    def setUp(self):
+        self.job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_locations_import",
+            task="msr_etl.jobs.run_ubr_locations_import",
+            user=self.owner,
+            status=AsyncJob.Status.RUNNING,
+        )
+
+    def test_owner_can_cancel_running_job(self):
+        errors = self.mutation.async_mutate(self.owner, id=self.job.id)
+        self.assertEqual(errors, [])
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.CANCELLED)
+        self.assertIsNotNone(self.job.finished_at)
+
+    def test_superuser_can_cancel_any_job(self):
+        # the default test-helper role for `owner` is IMIS admin -> superuser
+        other_job = AsyncJob.objects.create(
+            module="msr_etl",
+            job_type="ubr_locations_import",
+            task="msr_etl.jobs.run_ubr_locations_import",
+            user=self.other,
+            status=AsyncJob.Status.QUEUED,
+        )
+        errors = self.mutation.async_mutate(self.owner, id=other_job.id)
+        self.assertEqual(errors, [])
+        other_job.refresh_from_db()
+        self.assertEqual(other_job.status, AsyncJob.Status.CANCELLED)
+
+    def test_non_owner_non_superuser_denied(self):
+        with self.assertRaises(PermissionDenied):
+            self.mutation.async_mutate(self.other, id=self.job.id)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.RUNNING)
+
+    def test_already_terminal_job_returns_error_without_overwriting(self):
+        AsyncJob.objects.filter(id=self.job.id).update(
+            status=AsyncJob.Status.SUCCESS, finished_at=timezone.now()
+        )
+        errors = self.mutation.async_mutate(self.owner, id=self.job.id)
+        self.assertEqual(len(errors), 1)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, AsyncJob.Status.SUCCESS)
+
+    def test_missing_job_returns_error(self):
+        import uuid
+
+        errors = self.mutation.async_mutate(self.owner, id=uuid.uuid4())
+        self.assertEqual(len(errors), 1)
+
+    def test_mutation_field_registered(self):
+        from openIMIS.schema import schema as global_schema
+
+        sdl = str(global_schema)
+        self.assertIn("cancelAsyncJob(", sdl)
