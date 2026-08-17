@@ -57,6 +57,15 @@ def openimis_mutation_async(mutation_id, module, class_name):
         raise exc
 
 
+@shared_task(name="core_execute_async_job")
+def execute_async_job_task(job_uuid):
+    """Celery wrapper for the shared async-job entry point."""
+    from core.services.asyncJobServices import execute_async_job
+
+    execute_async_job(job_uuid)
+    return "OK"
+
+
 @shared_task(name="sample_batch")
 def openimis_test_batch():
     logger.info("sample batch")
