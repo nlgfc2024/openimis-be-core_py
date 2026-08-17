@@ -17,6 +17,28 @@ import shutil
 from openIMIS.openimisconf import load_openimis_conf
 
 
+def _update_module_messages(modules, locale):
+    """Run makemessages inside each module without scanning sibling packages."""
+    original_directory = os.getcwd()
+    module_directories = []
+    try:
+        for module in modules:
+            module_name = module["name"]
+            with resources.path(module_name, "__init__.py") as path:
+                module_directory = path.parent
+                os.chdir(module_directory)
+                print(
+                    f"Trying to run makemessages in {module_name} "
+                    f"with locale={locale}"
+                )
+                call_command("makemessages", locale=locale)
+                module_directories.append(module_directory)
+    finally:
+        os.chdir(original_directory)
+
+    return module_directories
+
+
 class Command(compilemessages.Command):
     def handle(self, **options):
         locale = options["locale"]
@@ -40,16 +62,7 @@ class Command(compilemessages.Command):
             basedirs.extend(settings.LOCALE_PATHS)
 
         # Walk entire tree, looking for locale directories
-        apps = []
-        for mod in load_openimis_conf()["modules"]:
-            mod_name = mod["name"]
-            with resources.path(mod_name, "__init__.py") as path:
-                os.chdir(path.parent.parent)
-                print(f'Trying to run makemessages in {mod_name} with locale={locale}')
-                call_command("makemessages", locale=locale)
-                apps.append(
-                    path.parent.parent
-                )  # This might need to be more restrictive
+        apps = _update_module_messages(load_openimis_conf()["modules"], locale)
 
         for topdir in ["."] + apps:
             for dirpath, dirnames, filenames in os.walk(topdir, topdown=True):
