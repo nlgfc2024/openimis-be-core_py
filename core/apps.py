@@ -65,7 +65,9 @@ DEFAULT_CFG = {
     "password_expiry_email_reminder_days": 5,
     "password_expiry_email_reminder_hour": 19,
     "password_expiry_email_reminder_minute": 10,
+    "async_job_jobstore_poll_seconds": 30,
     "gql_query_enable_viewing_masked_data_perms": ["900101"],
+    "gql_query_async_jobs_perms": ["900102"],
     "csrf_protect_login": True,
 }
 
@@ -109,6 +111,8 @@ class CoreConfig(AppConfig):
     password_expiry_email_reminder_days = 5
     password_expiry_email_reminder_hour = 19
     password_expiry_email_reminder_minute = 10
+    # heartbeat bounding pickup latency of handed-off async jobs; 0 disables
+    async_job_jobstore_poll_seconds = 30
 
     fields_controls_user = {}
     fields_controls_eo = {}
@@ -121,6 +125,7 @@ class CoreConfig(AppConfig):
     password_symbols = settings.PASSWORD_SYMBOLS
 
     gql_query_enable_viewing_masked_data_perms = []
+    gql_query_async_jobs_perms = []
 
     csrf_protect_login = None
 
@@ -249,6 +254,7 @@ class CoreConfig(AppConfig):
         CoreConfig.gql_query_enable_viewing_masked_data_perms = cfg[
             "gql_query_enable_viewing_masked_data_perms"
         ]
+        CoreConfig.gql_query_async_jobs_perms = cfg["gql_query_async_jobs_perms"]
         CoreConfig.csrf_protect_login = cfg["csrf_protect_login"]
 
         CoreConfig.fields_controls_user = cfg["fields_controls_user"]
@@ -289,6 +295,9 @@ class CoreConfig(AppConfig):
         )
         CoreConfig.password_expiry_email_reminder_minute = int(
             cfg["password_expiry_email_reminder_minute"]
+        )
+        CoreConfig.async_job_jobstore_poll_seconds = int(
+            cfg["async_job_jobstore_poll_seconds"]
         )
 
         # The scheduler starts as soon as it gets a job, which could be before Django is ready, so we enable it here

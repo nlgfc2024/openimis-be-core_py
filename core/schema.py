@@ -78,6 +78,7 @@ from core.utils import (  # noqa: 401
     filter_validity
 )
 from core.models import (
+    AsyncJob,
     ModuleConfiguration,
     FieldControl,
     MutationLog,
@@ -709,6 +710,81 @@ class MutationLogGQLType(DjangoObjectType):
         return queryset
 
 
+class AsyncJobGQLType(DjangoObjectType):
+    """
+    A background job and its live progress. Row-scoped: users see their own
+    jobs; superusers and holders of gql_query_async_jobs_perms see all.
+
+    params/result are exposed as-is - modules must not put credentials or
+    tokens in them.
+    """
+
+    # plain uuid alongside the relay id, so clients skip relay-ID decoding
+    uuid = graphene.UUID(source="id")
+
+    class Meta:
+        model = AsyncJob
+        interfaces = (graphene.relay.Node,)
+        filter_fields = {
+            "id": ["exact"],
+            "module": ["exact"],
+            "job_type": ["exact"],
+            "status": ["exact", "in"],
+            "client_mutation_id": ["exact"],
+            "created_at": ["exact", "gte", "lte"],
+            "user": ["exact"],
+        }
+        connection_class = ExtendedConnection
+
+    @classmethod
+    def get_queryset(cls, queryset, info):
+        user = info.context.user
+        if user.is_anonymous:
+            return queryset.none()
+        if user.is_superuser or user.has_perms(
+            CoreConfig.gql_query_async_jobs_perms
+        ):
+            return queryset
+        return queryset.filter(user=user)
+
+
+class CancelAsyncJobMutation(OpenIMISMutation):
+    """
+    Cooperatively cancel a background job that hasn't finished yet. Sets
+    status=CANCELLED immediately; the job itself stops at its next progress
+    checkpoint (ProgressReporter.advance()), not necessarily right away.
+    """
+
+    _mutation_module = "core"
+    _mutation_class = "CancelAsyncJobMutation"
+
+    class Input(OpenIMISMutation.Input):
+        id = graphene.UUID(required=True)
+
+    @classmethod
+    def async_mutate(cls, user, **data):
+        job = AsyncJob.objects.filter(id=data["id"]).first()
+        if job is None:
+            return [{"message": "core.mutation.async_job_not_found"}]
+
+        is_owner = job.user_id == getattr(user, "id", None)
+        if not (is_owner or user.is_superuser):
+            raise PermissionDenied(_("unauthorized"))
+
+        updated = (
+            AsyncJob.objects.filter(id=job.id)
+            .exclude(status__in=AsyncJob.TERMINAL_STATUSES)
+            .update(
+                status=AsyncJob.Status.CANCELLED,
+                finished_at=timezone.now(),
+                updated_at=timezone.now(),
+            )
+        )
+        if updated == 0:
+            return [{"message": "core.mutation.async_job_already_finished"}]
+        return []
+
+
 UT_INTERACTIVE = "INTERACTIVE"
 UT_TECHNICAL = "TECHNICAL"
 UT_OFFICER = "OFFICER"
@@ -760,6 +836,9 @@ class Query(graphene.ObjectType):
 
     mutation_logs = OrderedDjangoFilterConnectionField(
         MutationLogGQLType, orderBy=graphene.List(of_type=graphene.String)
+    )
+    async_jobs = OrderedDjangoFilterConnectionField(
+        AsyncJobGQLType, orderBy=graphene.List(of_type=graphene.String)
     )
 
     role = OrderedDjangoFilterConnectionField(
@@ -2239,6 +2318,8 @@ class Mutation(graphene.ObjectType):
     change_password = ChangePasswordMutation.Field()
     reset_password = ResetPasswordMutation.Field()
     set_password = SetPasswordMutation.Field()
+
+    cancel_async_job = CancelAsyncJobMutation.Field()
 
     token_auth = OpenimisObtainJSONWebToken.Field()
     verify_token = graphql_jwt.mutations.Verify.Field()

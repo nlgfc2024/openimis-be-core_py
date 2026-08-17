@@ -5,6 +5,7 @@ from core.models import user
 from core.models import history_model
 from core.models import base_mutation
 from core.models import user_mutation
+from core.models import async_job
 from core.utils import filter_validity
 
 
@@ -19,6 +20,7 @@ HistoryModel = history_model.HistoryModel
 HistoryBusinessModel = history_model.HistoryBusinessModel
 HistoryModelManager = history_model.HistoryModelManager
 MutationLog = base_mutation.MutationLog
+AsyncJob = async_job.AsyncJob
 UUIDVersionedModel = versioned_model.UUIDVersionedModel
 InteractiveUser = user.InteractiveUser
 TechnicalUser = user.TechnicalUser
