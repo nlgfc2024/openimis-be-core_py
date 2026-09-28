@@ -35,6 +35,19 @@ class GenerateUniqueYearCodeTest(SimpleTestCase):
         self.assertEqual(code, "202667890")
         self.assertEqual(self.model.objects.filter.call_count, 2)
 
+    @patch("core.code_generation.random.randint", return_value=12345)
+    def test_generates_a_prefixed_code(self, _):
+        self.model.objects.filter.return_value.exists.return_value = False
+
+        code = generate_unique_year_code(
+            self.model, self.active_filter, current_date=date(2026, 1, 1), prefix="GRS"
+        )
+
+        self.assertEqual(code, "GRS202612345")
+        self.model.objects.filter.assert_called_once_with(
+            code="GRS202612345", is_deleted=False
+        )
+
     def test_raises_after_all_attempts_collide(self):
         self.model.objects.filter.return_value.exists.return_value = True
 
