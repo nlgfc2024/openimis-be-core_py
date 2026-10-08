@@ -30,7 +30,7 @@ from core.services import (
     reset_user_password,
     set_user_password,
     user_authentication,
-    is_password_reset_rate_limited,  # added
+    is_password_reset_rate_limited, # added
     wait_for_mutation,
 )
 from core.tasks import openimis_mutation_async

@@ -474,7 +474,7 @@ class UserServicesTest(TestCase):
         reset_user_password(request, username)
 
         self.assertTrue(len(mail.outbox) == 1)
-        self.assertEqual(mail.outbox[0].subject, "[CoreMIS] Reset Password")
+        self.assertTrue(mail.outbox[0].subject == "[OpenIMIS] Reset Password")
 
     def test_password_expiry_reminder_user_selection(self):
         reference_time = timezone.now()

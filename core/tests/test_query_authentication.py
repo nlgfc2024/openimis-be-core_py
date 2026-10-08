@@ -6,12 +6,12 @@ from unittest.mock import Mock, patch
 import graphene
 from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import PermissionDenied
-from django.test import RequestFactory, SimpleTestCase
+from django.test import RequestFactory, SimpleTestCase, override_settings
 from django.utils.translation import gettext
 from graphql_jwt.exceptions import JSONWebTokenError
 
 from core.gql_errors import AuthenticationRequired
-from core.schema import OrderedDjangoFilterConnectionField, Query
+from core.schema import OrderedDjangoFilterConnectionField, Query, _check_csrf_token
 from core.utils import ExtendedConnection
 from openIMIS.views import OpenIMISGraphQLView
 
@@ -22,6 +22,11 @@ class AuthenticationQuery(graphene.ObjectType):
     connection_gate = graphene.Int()
     total_count = graphene.Int()
     edge_count = graphene.Int()
+    production_csrf = graphene.String()
+
+    def resolve_production_csrf(self, info):
+        _check_csrf_token(info.context)
+        return 'ok'
 
     resolve_languages = Query.resolve_languages
     resolve_username_length = Query.resolve_username_length
@@ -42,17 +47,23 @@ class AuthenticationQuery(graphene.ObjectType):
         )
 
 
-class QueryAuthenticationTests(SimpleTestCase):
-    def request(self, query, user=None):
+class QueryHttpTestCase(SimpleTestCase):
+    def request(self, query, user=None, session=None, csrf_token=None):
         request = RequestFactory().post(
             '/graphql', json.dumps({'query': query}),
             content_type='application/json',
         )
         request.user = user if user is not None else AnonymousUser()
+        request.session = session if session is not None else {}
+        if csrf_token is not None:
+            request.META['HTTP_X_CSRFTOKEN'] = csrf_token
         return OpenIMISGraphQLView.as_view(
             schema=graphene.Schema(query=AuthenticationQuery), middleware=[]
         )(request)
 
+
+
+class QueryAuthenticationTests(QueryHttpTestCase):
     def test_exception_message_and_type(self):
         error = AuthenticationRequired()
         self.assertIsInstance(error, JSONWebTokenError)
@@ -89,3 +100,33 @@ class QueryAuthenticationTests(SimpleTestCase):
         user = SimpleNamespace(is_authenticated=True, has_perms=Mock(return_value=False))
         with self.assertRaises(PermissionDenied):
             Query.resolve_username_length(None, SimpleNamespace(context=SimpleNamespace(user=user)))
+
+
+@override_settings(MODE='prod', IS_TESTING=False, USER_AGENT_CSRF_BYPASS=[])
+class ProductionCsrfTests(QueryHttpTestCase):
+    def test_matching_production_csrf_token_allows_request(self):
+        response = self.request(
+            '{ productionCsrf }', SimpleNamespace(is_authenticated=True),
+            session={'csrftoken': 'test-session-token'}, csrf_token='test-session-token',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content), {'data': {'productionCsrf': 'ok'}})
+
+    def test_expired_production_session_returns_exact_legacy_error(self):
+        response = self.request(
+            '{ productionCsrf }', SimpleNamespace(is_authenticated=True),
+            session={}, csrf_token='stale-session-token',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(json.loads(response.content)['errors'][0]['message'], "'csrftoken'")
+
+    def test_incorrect_production_csrf_token_remains_rejected(self):
+        response = self.request(
+            '{ productionCsrf }', SimpleNamespace(is_authenticated=True),
+            session={'csrftoken': 'test-session-token'}, csrf_token='incorrect',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            json.loads(response.content)['errors'][0]['message'],
+            'CSRF token missing or incorrect.',
+        )
