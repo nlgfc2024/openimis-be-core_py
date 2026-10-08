@@ -42,6 +42,15 @@ class ComparableTest(TestCase):
 
 
 class UtilsTestCase(TestCase):
+    def test_reusing_interactive_user_preserves_password(self):
+        user = create_test_interactive_user(username="fixture_reuse")
+        original_hash = user.i_user.password
+        original_expiry = user.i_user.password_validity
+        reused = create_test_interactive_user(username="fixture_reuse")
+        self.assertEqual(reused.pk, user.pk)
+        self.assertEqual(reused.i_user.password, original_hash)
+        self.assertEqual(reused.i_user.password_validity, original_expiry)
+
     def test_full_class_name(self):
         self.assertEqual(full_class_name(self), "core.tests.test_utils.UtilsTestCase")
 

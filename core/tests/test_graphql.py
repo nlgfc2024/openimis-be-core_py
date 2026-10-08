@@ -115,10 +115,11 @@ class gqlTest(openIMISGraphQLTestCase):
         username = "PasswordExpiryWarningUser"
         password = "ExpiringPass123!"
         user = create_test_interactive_user(username=username, password=password)
-        expiry_date = timezone.localdate() + datetime.timedelta(days=5)
-        user.i_user.password_validity = timezone.make_aware(
-            datetime.datetime.combine(expiry_date, datetime.time(hour=12))
-        )
+        expiry_date = timezone.now().date() + datetime.timedelta(days=5)
+        expires_at = datetime.datetime.combine(expiry_date, datetime.time(hour=12))
+        if timezone.is_aware(timezone.now()):
+            expires_at = timezone.make_aware(expires_at)
+        user.i_user.password_validity = expires_at
         user.i_user.save()
 
         query = """
@@ -150,13 +151,14 @@ class gqlTest(openIMISGraphQLTestCase):
         self.assertEqual(data["username"], username)
 
     def test_login_password_expiry_warning_outside_threshold(self):
-        username = "PasswordExpiryNoWarningUser"
+        username = "ExpiryNoWarningUser"
         password = "NotExpiringPass123!"
         user = create_test_interactive_user(username=username, password=password)
-        expiry_date = timezone.localdate() + datetime.timedelta(days=6)
-        user.i_user.password_validity = timezone.make_aware(
-            datetime.datetime.combine(expiry_date, datetime.time(hour=12))
-        )
+        expiry_date = timezone.now().date() + datetime.timedelta(days=6)
+        expires_at = datetime.datetime.combine(expiry_date, datetime.time(hour=12))
+        if timezone.is_aware(timezone.now()):
+            expires_at = timezone.make_aware(expires_at)
+        user.i_user.password_validity = expires_at
         user.i_user.save()
 
         query = """
