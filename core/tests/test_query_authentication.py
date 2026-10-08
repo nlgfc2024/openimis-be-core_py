@@ -62,7 +62,6 @@ class QueryHttpTestCase(SimpleTestCase):
         )(request)
 
 
-
 class QueryAuthenticationTests(QueryHttpTestCase):
     def test_exception_message_and_type(self):
         error = AuthenticationRequired()
