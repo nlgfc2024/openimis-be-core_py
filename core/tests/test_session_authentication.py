@@ -12,7 +12,18 @@ from graphql_jwt.shortcuts import get_token
 from core.test_helpers import create_test_interactive_user
 
 
+# CI loads dev settings, which remove this middleware at import time. Restore
+# the production CSRF pipeline, not only the MODE flag, for these requests.
+PRODUCTION_MIDDLEWARE = list(settings.MIDDLEWARE)
+if 'django.middleware.csrf.CsrfViewMiddleware' not in PRODUCTION_MIDDLEWARE:
+    PRODUCTION_MIDDLEWARE.insert(
+        PRODUCTION_MIDDLEWARE.index('django.contrib.sessions.middleware.SessionMiddleware') + 1,
+        'django.middleware.csrf.CsrfViewMiddleware',
+    )
+
+
 @override_settings(
+    MIDDLEWARE=PRODUCTION_MIDDLEWARE,
     MODE='prod', IS_TESTING=False, CSRF_USE_SESSIONS=True,
     USER_AGENT_CSRF_BYPASS=[], ALLOWED_HOSTS=['testserver'],
 )
@@ -99,3 +110,20 @@ class SessionAuthenticationTests(TestCase):
         self.assertNotIn('errors', response.json())
         self.assertTrue(response.cookies[jwt_settings.JWT_COOKIE_NAME].value)
         self.assertNotIn(jwt_settings.JWT_REFRESH_TOKEN_COOKIE_NAME, response.cookies)
+
+    def test_logout_recovers_csrf_with_invalid_jwt_and_no_session(self):
+        self.client.cookies[jwt_settings.JWT_COOKIE_NAME] = 'invalid'
+        response = self.client.get(f'{self.logout_url}csrf/')
+        self.assertEqual(response.status_code, 200)
+        token = response.json()['csrfToken']
+        self.assertEqual(self.client.post(self.logout_url, HTTP_X_CSRFTOKEN=token).status_code, 204)
+
+    @override_settings(CSRF_USE_SESSIONS=False)
+    def test_logout_bootstrap_supports_cookie_csrf_without_global_middleware(self):
+        middleware = [m for m in settings.MIDDLEWARE if m != 'django.middleware.csrf.CsrfViewMiddleware']
+        with override_settings(MIDDLEWARE=middleware):
+            self.login_session()
+            response = self.client.get(f'{self.logout_url}csrf/')
+            token = response.json()['csrfToken']
+            self.assertEqual(self.client.post(self.logout_url, HTTP_X_CSRFTOKEN=token).status_code, 204)
+            self.assertNotIn(SESSION_KEY, self.client.session)

@@ -1,6 +1,7 @@
-from django.http import Http404, StreamingHttpResponse, HttpResponse
+from django.http import Http404, StreamingHttpResponse, HttpResponse, JsonResponse
 from django.views.decorators.http import require_GET, require_POST
-from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
+from django.middleware.csrf import get_token
 from django.contrib.auth import logout
 from rest_framework.authentication import SessionAuthentication
 from graphql_jwt.settings import jwt_settings
@@ -105,6 +106,13 @@ def _serialize_job(job):
 @require_GET
 def get_scheduled_jobs(request):
     return Response([_serialize_job(job) for job in scheduler.get_jobs()])
+
+
+@require_GET
+@ensure_csrf_cookie
+def logout_csrf_token(request):
+    """Bootstrap logout CSRF independently of expired JWT authentication."""
+    return JsonResponse({'csrfToken': get_token(request)})
 
 
 @require_POST
