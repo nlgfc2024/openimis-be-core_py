@@ -30,7 +30,7 @@ from core.services import (
     reset_user_password,
     set_user_password,
     user_authentication,
-    is_password_reset_rate_limited, # added
+    is_password_reset_rate_limited,  # added
     wait_for_mutation,
 )
 from core.tasks import openimis_mutation_async
@@ -40,6 +40,8 @@ from django import dispatch
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import ValidationError, PermissionDenied
+from core.gql_errors import AuthenticationRequired
+from core.authentication import require_active_password
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import IntegrityError, transaction
 from django.db.models import Q, Count
@@ -200,6 +202,7 @@ class ParsedJSONString(graphene.JSONString):
 
 
 def _check_csrf_token(request):
+    require_active_password(request.user)
     user_agent = request.headers.get("User-Agent", "")
     if not (settings.MODE == 'dev' or settings.IS_TESTING or any(
         bypass in user_agent
@@ -651,7 +654,7 @@ class OrderedDjangoFilterConnectionField(DjangoFilterConnectionField):
         request = getattr(info, "context", None)
 
         if not info.context.user.is_authenticated:
-            raise PermissionDenied(_("unauthorized"))
+            raise AuthenticationRequired()
 
         _check_csrf_token(request)
 
@@ -1464,7 +1467,8 @@ class Query(graphene.ObjectType):
 
     def resolve_languages(self, info, **kwargs):
         if not info.context.user.is_authenticated:
-            raise PermissionDenied(_("unauthorized"))
+            raise AuthenticationRequired()
+        require_active_password(info.context.user)
         return Language.objects.order_by("sort_order").all()
 
 

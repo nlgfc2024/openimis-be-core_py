@@ -10,7 +10,9 @@ import graphene
 import jsonschema
 from django.db import models
 from django.conf import settings
-from django.core.exceptions import PermissionDenied, ValidationError, FieldDoesNotExist
+from django.core.exceptions import ValidationError, FieldDoesNotExist
+from core.gql_errors import AuthenticationRequired
+from core.authentication import require_active_password
 from django.core.files.storage import default_storage
 from django.db.models import Q, ForeignKey
 from django.http import FileResponse
@@ -667,12 +669,14 @@ class ExtendedConnection(graphene.Connection):
 
     def resolve_total_count(self, info, **kwargs):
         if not info.context.user.is_authenticated:
-            raise PermissionDenied(_("unauthorized"))
+            raise AuthenticationRequired()
+        require_active_password(info.context.user)
         return self.length
 
     def resolve_edge_count(self, info, **kwargs):
         if not info.context.user.is_authenticated:
-            raise PermissionDenied(_("unauthorized"))
+            raise AuthenticationRequired()
+        require_active_password(info.context.user)
         return len(self.edges)
 
 

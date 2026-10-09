@@ -182,7 +182,10 @@ def create_test_interactive_user(
     except ValidationError:
         # unchanged
         pass
-    i_user.set_password(password, private_key=i_user.private_key)
+    # Reusing a fixture is not a password change. Keep its hash/history intact
+    # when it already has the requested password; production reuse checks stay on.
+    if not i_user.password or not i_user.check_password(password):
+        i_user.set_password(password, private_key=i_user.private_key)
     try:
         i_user.save()
     except ValidationError:

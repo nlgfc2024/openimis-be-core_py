@@ -274,6 +274,7 @@ def change_user_password(
     user_to_update.set_password(new_password)
     user_to_update.save()
 
+
 def set_user_password(request, username, token, password):
     with transaction.atomic():
         user = User.objects.select_for_update().get(
@@ -337,6 +338,7 @@ def check_user_unique_email(user_email):
         return [{"message": "User email %s already exists" % user_email}]
     return []
 
+
 def _increment_reset_counter(key, timeout):
     if cache.add(key, 1, timeout=timeout):
         return 1
@@ -373,6 +375,8 @@ def is_password_reset_rate_limited(request, username):
         ip_count > settings.PASSWORD_RESET_RATE_LIMIT_PER_IP
         or account_count > settings.PASSWORD_RESET_RATE_LIMIT_PER_ACCOUNT
     )
+
+
 def reset_user_password(request, username):
     normalized_username = (username or "").strip()
 
