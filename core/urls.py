@@ -6,6 +6,7 @@ router = DefaultRouter()
 router.register(r"users", views.UserViewSet)
 
 urlpatterns = [
+    path("logout/", views.logout_session),
     path("", include(router.urls)),
     path("fetch_export", views.fetch_export),
     path("scheduled_jobs", views.get_scheduled_jobs),
