@@ -299,3 +299,7 @@ msgstr "Schema Admin"
 
 msgid "Task Triage"
 msgstr "Task Triage"
+
+#: core/gql_errors.py:9
+msgid "unauthenticated"
+msgstr "Authentication required"

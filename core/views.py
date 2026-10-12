@@ -1,5 +1,13 @@
-from django.http import Http404, StreamingHttpResponse
-from django.views.decorators.http import require_GET
+from django.http import Http404, StreamingHttpResponse, HttpResponse, JsonResponse
+from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.csrf import csrf_protect, ensure_csrf_cookie
+from django.middleware.csrf import get_token
+from django.contrib.auth import logout
+from rest_framework.authentication import SessionAuthentication
+from graphql_jwt.settings import jwt_settings
+from graphql_jwt.utils import delete_cookie
+from core.authentication import password_expired
+from core.jwt_authentication import JWTAuthentication
 from isodate import strftime
 from rest_framework import viewsets, status
 from rest_framework.decorators import action, api_view
@@ -31,8 +39,17 @@ class UserViewSet(viewsets.ModelViewSet):
 
     @action(detail=False)
     def current_user(self, request):
+        if password_expired(request.user):
+            return Response({'detail': 'PASSWORD_EXPIRED'}, status=status.HTTP_401_UNAUTHORIZED)
         serializer = self.get_serializer(request.user, many=False)
-        return Response(serializer.data)
+        data = dict(serializer.data)
+        authenticator = request.successful_authenticator
+        data['authMode'] = (
+            'jwt' if isinstance(authenticator, JWTAuthentication)
+            else 'session' if isinstance(authenticator, SessionAuthentication)
+            else 'other'
+        )
+        return Response(data)
 
 
 @api_view(["GET"])
@@ -89,3 +106,25 @@ def _serialize_job(job):
 @require_GET
 def get_scheduled_jobs(request):
     return Response([_serialize_job(job) for job in scheduler.get_jobs()])
+
+
+@require_GET
+@ensure_csrf_cookie
+def logout_csrf_token(request):
+    """Bootstrap logout CSRF independently of expired JWT authentication."""
+    return JsonResponse({'csrfToken': get_token(request)})
+
+
+@require_POST
+@csrf_protect
+def logout_session(request):
+    """End both Django and JWT authentication, even if the JWT has expired.
+
+    This deliberately uses Django rather than DRF authentication: an invalid JWT
+    must not prevent logout of a valid Django session. CSRF protection still runs.
+    """
+    logout(request)
+    response = HttpResponse(status=204)
+    delete_cookie(response, jwt_settings.JWT_COOKIE_NAME)
+    delete_cookie(response, jwt_settings.JWT_REFRESH_TOKEN_COOKIE_NAME)
+    return response
