@@ -515,3 +515,32 @@ This will make the data appear in the masked way again.
 
 ## openIMIS Modules Dependencies
 N.A.
+
+
+## Export column policy
+
+`ExportableQueryMixin` validates client `fields` against a server-side allowlist
+before calling the source resolver or writing a file. By default this list comes
+from scalar fields declared on the query's GraphQL model type, including scalar
+annotations, and declared forward foreign-key/one-to-one relations (up to four
+relations deep). Both dotted camelCase and Django `__` column notation are
+normalized before checking the list.
+
+Declared model JSON fields also allow non-empty key paths, for example
+`json_ext__national_id`, `jsonExt.household.village` or
+`individual.jsonExt.nationalId`. These select JSON values without joining to
+other rows. Hidden JSON fields and JSON paths reached through collection joins
+remain disallowed. To restrict JSON keys in `get_exportable_columns`, return
+only the specific key paths (for example `json_ext__national_id`); including
+`json_ext` permits all keys beneath it.
+
+Reverse relations, many-to-many collections, undeclared fields and deeper paths
+are rejected. A scoped source queryset alone cannot restrict rows reached by a
+reverse join such as `benefitPlan.project.name`. Existing export clients using
+these collection paths must select scalar or forward relation columns instead.
+Queries can override `get_exportable_columns(field_name)` to return a narrower
+explicit set of normalized ORM column names. Existing `exportable_fields`
+continues to identify which root queries support export.
+
+The source resolver still enforces permissions and row scope. This column policy
+does not invoke per-field GraphQL resolvers or grant access to related collections.
