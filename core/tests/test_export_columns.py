@@ -16,6 +16,7 @@ from core.models import ExportableQueryModel
 
 class ExportParent(models.Model):
     name = models.CharField(max_length=30)
+    json_ext = models.JSONField(default=dict)
     secret = models.CharField(max_length=30)
     parent = models.ForeignKey('self', null=True, on_delete=models.CASCADE)
 
@@ -26,6 +27,8 @@ class ExportParent(models.Model):
 
 class ExportRow(models.Model):
     name = models.CharField(max_length=30)
+    json_ext = models.JSONField(default=dict)
+    hidden_json = models.JSONField(default=dict)
     parent = models.ForeignKey(ExportParent, related_name='rows', on_delete=models.CASCADE)
     tags = models.ManyToManyField(ExportParent, related_name='tagged_rows')
 
@@ -42,7 +45,7 @@ class ExportParentType(DjangoObjectType):
 
     class Meta:
         model = ExportParent
-        fields = ('name', 'parent', 'rows')
+        fields = ('name', 'json_ext', 'parent', 'rows')
         registry = registry
 
 
@@ -51,7 +54,7 @@ class ExportRowType(DjangoObjectType):
 
     class Meta:
         model = ExportRow
-        fields = ('id', 'name', 'parent', 'tags')
+        fields = ('id', 'name', 'json_ext', 'parent', 'tags')
         registry = registry
 
 
@@ -78,6 +81,34 @@ class ExportColumnTests(SimpleTestCase):
         ]:
             with self.subTest(column=column), self.assertRaises(ValidationError):
                 ExportQuery.validate_export_columns('rows', [column])
+
+    def test_declared_json_key_paths_are_allowed(self):
+        self.assertEqual(ExportQuery.validate_export_columns('rows', [
+            'json_ext__national_id', 'jsonExt.household.village',
+            'json_ext__members__0__name', 'parent.jsonExt.nationalId',
+        ]), [
+            'json_ext__national_id', 'json_ext__household__village',
+            'json_ext__members__0__name', 'parent__json_ext__national_id',
+        ])
+
+    def test_json_keys_do_not_allow_hidden_fields_or_collection_joins(self):
+        for column in [
+            'hidden_json__secret', 'unknown_json__name', 'name__key',
+            'json_ext__', 'json_ext____key', 'parent.rows.jsonExt.key',
+            'tags.jsonExt.key', 'parent.parent.parent.parent.parent.jsonExt.key',
+        ]:
+            with self.subTest(column=column), self.assertRaises(ValidationError):
+                ExportQuery.validate_export_columns('rows', [column])
+
+    def test_json_keys_respect_query_specific_allowlist(self):
+        with patch.object(ExportQuery, 'get_exportable_columns', return_value={'name'}):
+            with self.assertRaises(ValidationError):
+                ExportQuery.validate_export_columns('rows', ['json_ext__national_id'])
+        with patch.object(ExportQuery, 'get_exportable_columns', return_value={'json_ext__national_id'}):
+            self.assertEqual(ExportQuery.validate_export_columns('rows', ['json_ext__national_id']),
+                             ['json_ext__national_id'])
+            with self.assertRaises(ValidationError):
+                ExportQuery.validate_export_columns('rows', ['json_ext__other'])
 
     def test_missing_empty_and_invalid_columns_are_rejected(self):
         for columns in [None, [], [''], [None], [123], 'name', {'name': 'Name'}]:
@@ -106,8 +137,8 @@ class ExportColumnTests(SimpleTestCase):
         create.return_value.name = 'export.csv'
         info = SimpleNamespace(context=SimpleNamespace(user=Mock()))
         result = ExportQuery.resolve_rows_export(
-            None, info, fields=['name', 'parent.name'], fields_columns=json.dumps({}),
+            None, info, fields=['name', 'parent.name', 'json_ext__national_id'], fields_columns=json.dumps({}),
         )
         self.assertEqual(result, 'export.csv')
-        self.assertEqual(create.call_args.args[1], ['name', 'parent__name'])
+        self.assertEqual(create.call_args.args[1], ['name', 'parent__name', 'json_ext__national_id'])
         self.assertEqual(create.call_args.args[2], info.context.user)

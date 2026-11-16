@@ -6,6 +6,7 @@ from typing import Dict, List, Callable
 
 import graphene
 from django.core.exceptions import ValidationError
+from django.db.models import JSONField
 from graphene.types.generic import GenericScalar
 from pandas import DataFrame
 
@@ -60,6 +61,15 @@ class ExportableQueryMixin:
         return cls.exportable_fields
 
     @classmethod
+    def _get_exportable_type(cls, field_name):
+        root_type = getattr(cls, field_name).type
+        while hasattr(root_type, "of_type"):
+            root_type = root_type.of_type
+        if not hasattr(root_type._meta, "model"):
+            root_type = root_type._meta.node
+        return root_type
+
+    @classmethod
     def get_exportable_columns(cls, field_name):
         """Allow declared scalar columns and forward to-one relation columns.
 
@@ -68,13 +78,7 @@ class ExportableQueryMixin:
         Bound traversal to four relations (including Location.parent chains).
         Override this method to return a narrower explicit set for a query.
         """
-        source = getattr(cls, field_name)
-        root_type = source.type
-        while hasattr(root_type, "of_type"):
-            root_type = root_type.of_type
-        # Connection fields expose their node type rather than a model directly.
-        if not hasattr(root_type._meta, "model"):
-            root_type = root_type._meta.node
+        root_type = cls._get_exportable_type(field_name)
 
         @lru_cache(maxsize=None)
         def columns(gql_type, depth):
@@ -109,6 +113,23 @@ class ExportableQueryMixin:
         return columns(root_type, 4)
 
     @classmethod
+    def _is_exportable_json_key(cls, field_name, column, allowed):
+        parts = column.split("__")
+        if len(parts) < 2 or not all(parts):
+            return False
+        model = cls._get_exportable_type(field_name)._meta.model
+        for index, part in enumerate(parts[:-1], 1):
+            # Only traverse concrete forward fields; the allowlist still controls
+            # GraphQL exposure, relation depth and query-specific restrictions.
+            field = next((field for field in model._meta.fields if field.name == part), None)
+            if isinstance(field, JSONField):
+                return "__".join(parts[:index]) in allowed
+            if field is None or not field.is_relation:
+                return False
+            model = field.related_model
+        return False
+
+    @classmethod
     def validate_export_columns(cls, field_name, fields):
         if not isinstance(fields, (list, tuple)) or not fields or any(
             not isinstance(field, str) or not field for field in fields
@@ -116,7 +137,8 @@ class ExportableQueryMixin:
             raise ValidationError("Export requires a non-empty list of column names.")
         normalized = [cls._adjust_notation(field) for field in fields]
         allowed = cls.get_exportable_columns(field_name)
-        if any(field not in allowed for field in normalized):
+        if any(field not in allowed and not cls._is_exportable_json_key(field_name, field, allowed)
+               for field in normalized):
             raise ValidationError("One or more requested export columns are not allowed.")
         return normalized
 
